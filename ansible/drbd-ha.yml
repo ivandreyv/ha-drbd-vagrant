@@ -1,0 +1,181 @@
+---
+-
+  become: true
+  hosts: node1,node2
+  become_method: sudo
+  become_user: root
+  tasks:
+  - name: Creates directory /sharefs
+    file:
+      mode: "0775"
+      path: /sharefs
+      state: directory
+
+  - name: Add node1 to  /etc/hosts
+    ansible.builtin.lineinfile:
+      path: /etc/hosts
+      regexp: "{{ hostvars['node1'].ansible_ip }} {{ hostvars['node1'].inventory_hostname }}"
+      line: "{{ hostvars['node1'].ansible_ip }} {{ hostvars['node1'].inventory_hostname }}"
+
+  - name: Add node2 to  /etc/hosts
+    ansible.builtin.lineinfile:
+      path: /etc/hosts
+      regexp: "{{ hostvars['node2'].ansible_ip }} {{ hostvars['node2'].inventory_hostname }}"
+      line: "{{ hostvars['node2'].ansible_ip }} {{ hostvars['node2'].inventory_hostname }}"
+
+  - name: Add script /root/mk-sdc1.sh
+    copy:
+      dest: "/root/mk-sdc1.sh"
+      mode: "0777"
+      content: |
+        #!/bin/bash
+        echo -e "n\np\n1\n\n\nw" | fdisk /dev/sdc
+
+  - name: Make /dev/sdc1
+    shell: /root/mk-sdc1.sh
+
+  - name: Update APT
+    apt:
+      update_cache: yes
+
+  - name: Install kernel modules
+    shell: apt install -y linux-modules-extra-$(uname -r)
+
+  - name: Install packages
+    apt:
+      name:
+        - drbd-utils
+        - heartbeat
+    ignore_errors: true
+
+  - name: Add config /etc/ha.d/ha.cf
+    copy:
+      dest: "/etc/ha.d/ha.cf"
+      content: |
+        logfacility     local0
+        autojoin none
+        warntime 5
+        deadtime 15
+        initdead 60
+        keepalive 2
+
+        ucast enp0s8 {{ hostvars['node1'].ansible_ip }}
+        ucast enp0s8 {{ hostvars['node2'].ansible_ip }}
+
+        auto_failback on
+
+        node {{ hostvars['node1'].inventory_hostname }}
+        node {{ hostvars['node2'].inventory_hostname }}
+
+  - name: Add config /etc/ha.d/authkeys
+    copy:
+      dest: "/etc/ha.d/authkeys"
+      content: |
+        auth 1
+        1 sha1 2bafa4115037533ffa8d648ce269410a
+      mode: 0600
+
+  - name: Add config /etc/ha.d/haresources
+    copy:
+      dest: "/etc/ha.d/haresources"
+      content: |      
+        {{ hostvars['node1'].inventory_hostname }} shared-drive
+
+  - name: Add script /etc/init.d/shared-drive
+    copy:
+      dest: "/etc/init.d/shared-drive"
+      content: |
+        #!/bin/bash
+
+        param=$1
+
+        if [ "start" == "$param" ] ; then
+          drbdadm primary test
+          mount /dev/drbd0 /sharefs
+          exit 0
+        elif [ "stop" == "$param" ] ; then
+          umount /sharefs
+          drbdadm secondary test
+          exit 0;
+        elif [ "status" == "$param" ] ; then
+          exit 0;
+        else
+          echo "no such command $param"
+        exit 1;
+        fi
+      mode: 0700
+      
+  - name: Add global drbd config /etc/drbd.d/global_common.conf
+    copy:
+      dest: "/etc/drbd.d/global_common.conf"
+      content: |
+        global {
+            usage-count  yes;
+        }
+        common {
+            net {
+                protocol C;
+           }
+        }        
+
+  - name: Add resource drbd config /etc/drbd.d/test.res
+    copy:
+      dest: "/etc/drbd.d/test.res"
+      content: |
+        resource test {
+            device /dev/drbd0;
+            disk /dev/sdc1;
+            meta-disk internal;
+            on  {{ hostvars['node1'].inventory_hostname }} {
+                address {{ hostvars['node1'].ansible_ip }}:7789;
+            }
+            on  {{ hostvars['node2'].inventory_hostname }} {
+                address {{ hostvars['node2'].ansible_ip }}:7789;
+            }
+        }
+
+  - name: modprobe drbd
+    shell: modprobe drbd
+
+  - name: Create test resource
+    shell: drbdadm create-md test
+
+  - name: Up test resource
+    shell: drbdadm up test
+
+-
+  become: true
+  hosts: node1
+  become_method: sudo
+  become_user: root
+  tasks:
+  - name: Create script /root/activate-mirror.sh
+    copy:
+      dest: "/root/activate-mirror.sh"
+      mode: "0777"
+      content: |
+        #!/bin/bash
+        drbdadm primary --force test
+        sleep 1
+        while grep "sync'ed" /proc/drbd
+          do sleep 1
+        done
+        mkfs.ext4 /dev/drbd0
+
+  - name: Activate-mirror
+    shell: /root/activate-mirror.sh
+        
+-
+  become: true
+  hosts: node1,node2
+  become_method: sudo
+  become_user: root
+  tasks:
+  - name: enable drbd service
+    shell: systemctl enable drbd
+
+  - name: Restart heartbeat service
+    shell: systemctl restart heartbeat    
+      
+      
+
